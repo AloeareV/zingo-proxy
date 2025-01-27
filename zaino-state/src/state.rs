@@ -15,7 +15,7 @@ use zebra_chain::subtree::NoteCommitmentSubtreeIndex;
 use zebra_rpc::methods::trees::{GetSubtrees, GetTreestate};
 use zebra_rpc::methods::{
     AddressBalance, AddressStrings, GetAddressTxIdsRequest, GetAddressUtxos, GetBlockTransaction,
-    GetRawTransaction, SentTransactionHash,
+    GetRawTransaction, SentTransactionHash, TransactionObject,
 };
 use zebra_rpc::server::error::LegacyCode;
 
@@ -415,7 +415,7 @@ impl ZcashIndexer for StateService {
     )]
     fn z_get_block<'life0, 'async_trait>(
         &'life0 self,
-        hash_or_height: String,
+        hash_or_height_string: String,
         verbosity: Option<u8>,
     ) -> ::core::pin::Pin<
         Box<
@@ -428,20 +428,141 @@ impl ZcashIndexer for StateService {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        let hash_or_height = hash_or_height.clone();
+        let verbosity = verbosity.unwrap_or(1);
+        let hash_or_height = HashOrHeight::from_str(&hash_or_height_string);
         Box::pin(async move {
-            let hash_or_height = HashOrHeight::from_str(&hash_or_height)?;
-            let request = ReadRequest::Block(hash_or_height);
-            let response = self.checked_call(request).await;
-            let block = match response {
-                Ok(ReadResponse::Block(Some(block))) => Ok(block),
-                Ok(ReadResponse::Block(None)) => Err(todo!()),
-                Ok(unexpected) => {
-                    unreachable!("Unexpected response from state service: {unexpected:?}")
+            match verbosity {
+                0 => {
+                    let request = ReadRequest::Block(hash_or_height?);
+                    let response = self.checked_call(request).await;
+                    match response {
+                        Ok(ReadResponse::Block(Some(block))) => Ok(GetBlock::Raw(block.into())),
+                        Ok(ReadResponse::Block(None)) => {
+                            Err(StateServiceError::RpcError(RpcError::new_from_legacycode(
+                                LegacyCode::InvalidParameter,
+                                "block not found",
+                            )))
+                        }
+                        Ok(unexpected) => {
+                            unreachable!("Unexpected response from state service: {unexpected:?}")
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
-                Err(e) => Err(e),
-            }?;
-            todo!()
+                1 | 2 => {
+                    let hash_or_height = hash_or_height?;
+                    let txids_or_fullblock_request = match verbosity {
+                        1 => ReadRequest::TransactionIdsForBlock(hash_or_height),
+                        2 => ReadRequest::Block(hash_or_height),
+                        _ => unreachable!("verbosity is known to be 1 or 2"),
+                    };
+
+                    let (txids_or_fullblock, orchard_tree, header) = futures::join!(
+                        self.checked_call(txids_or_fullblock_request),
+                        self.checked_call(ReadRequest::OrchardTree(hash_or_height)),
+                        self.get_block_header(hash_or_height_string, Some(true))
+                    );
+
+                    let header_obj = match header? {
+                        GetBlockHeader::Raw(_hex_data) => unreachable!(
+                            "`true` was passed to get_block_header, an object should be returned"
+                        ),
+                        GetBlockHeader::Object(get_block_header_object) => get_block_header_object,
+                    };
+                    let GetBlockHeaderObject {
+                        hash,
+                        confirmations,
+                        height,
+                        version,
+                        merkle_root,
+                        final_sapling_root,
+                        sapling_tree_size,
+                        time,
+                        nonce,
+                        solution,
+                        bits,
+                        difficulty,
+                        previous_block_hash,
+                        next_block_hash,
+                    } = *header_obj;
+
+                    let transactions_response: Vec<GetBlockTransaction> = match txids_or_fullblock {
+                        Ok(ReadResponse::TransactionIdsForBlock(Some(txids))) => Ok(txids
+                            .iter()
+                            .copied()
+                            .map(GetBlockTransaction::Hash)
+                            .collect()),
+                        Ok(ReadResponse::Block(Some(block))) => Ok(block
+                            .transactions
+                            .iter()
+                            .map(|transaction| {
+                                GetBlockTransaction::Object(TransactionObject {
+                                    hex: transaction.as_ref().into(),
+                                    height: Some(height.0),
+                                    // Confirmations should never be greater than the current block height
+                                    confirmations: Some(confirmations as u32),
+                                })
+                            })
+                            .collect()),
+                        Ok(ReadResponse::TransactionIdsForBlock(None))
+                        | Ok(ReadResponse::Block(None)) => {
+                            Err(StateServiceError::RpcError(RpcError::new_from_legacycode(
+                                LegacyCode::InvalidParameter,
+                                "block not found",
+                            )))
+                        }
+                        Ok(unexpected) => {
+                            unreachable!("Unexpected response from state service: {unexpected:?}")
+                        }
+                        Err(e) => Err(e),
+                    }?;
+
+                    let orchard_tree_response = match orchard_tree? {
+                        ReadResponse::OrchardTree(Some(tree)) => Ok(tree),
+                        ReadResponse::OrchardTree(None) => Err(StateServiceError::RpcError(
+                            RpcError::new_from_legacycode(LegacyCode::Misc, "missing orchard tree"),
+                        )),
+                        unexpected => {
+                            unreachable!("Unexpected response from state service: {unexpected:?}")
+                        }
+                    }?;
+
+                    let final_orchard_root =
+                        match NetworkUpgrade::Nu5.activation_height(&self.config.network) {
+                            Some(activation_height) if height >= activation_height => {
+                                Some(orchard_tree_response.root().into())
+                            }
+                            _otherwise => None,
+                        };
+
+                    let trees =
+                        GetBlockTrees::new(sapling_tree_size, orchard_tree_response.count());
+
+                    Ok(GetBlock::Object {
+                        hash,
+                        confirmations,
+                        height: Some(height),
+                        version: Some(version),
+                        merkle_root: Some(merkle_root),
+                        time: Some(time),
+                        nonce: Some(nonce),
+                        solution: Some(solution),
+                        bits: Some(bits),
+                        difficulty: Some(difficulty),
+                        tx: transactions_response,
+                        trees,
+                        size: None,
+                        final_sapling_root: Some(final_sapling_root),
+                        final_orchard_root,
+                        previous_block_hash: Some(previous_block_hash),
+                        next_block_hash,
+                    })
+                }
+                more_than_two => Err(StateServiceError::RpcError(RpcError::new_from_legacycode(
+                    LegacyCode::InvalidParameter,
+                    format!("invalid verbosity of {more_than_two}"),
+                ))),
+            }
         })
     }
 

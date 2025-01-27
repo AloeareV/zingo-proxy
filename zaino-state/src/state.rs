@@ -1,15 +1,22 @@
 //! Zcash chain fetch and tx submission service backed by Zebras [`ReadStateService`].
 
 use chrono::Utc;
-use hex::ToHex;
+use hex::{FromHex as _, ToHex};
 use indexmap::IndexMap;
 use std::io::Cursor;
+use std::str::FromStr as _;
 use std::{future::poll_fn, pin::pin};
 use tokio::time::timeout;
 use tower::Service;
 use zaino_proto::proto::service::BlockRange;
 use zebra_chain::parameters::Network;
-use zebra_rpc::methods::GetBlockTransaction;
+use zebra_chain::serialization::SerializationError;
+use zebra_chain::subtree::NoteCommitmentSubtreeIndex;
+use zebra_rpc::methods::trees::{GetSubtrees, GetTreestate};
+use zebra_rpc::methods::{
+    AddressBalance, AddressStrings, GetAddressTxIdsRequest, GetAddressUtxos, GetBlockTransaction,
+    GetRawTransaction, SentTransactionHash,
+};
 use zebra_rpc::server::error::LegacyCode;
 
 use zebra_chain::{
@@ -26,8 +33,11 @@ use zebra_rpc::{
     },
     sync::init_read_state_with_syncer,
 };
-use zebra_state::{ChainTipChange, HashOrHeight, LatestChainTip, ReadStateService};
+use zebra_state::{
+    ChainTipChange, HashOrHeight, LatestChainTip, ReadRequest, ReadResponse, ReadStateService,
+};
 
+use crate::indexer::ZcashIndexer;
 use crate::{
     config::StateServiceConfig,
     error::StateServiceError,
@@ -35,7 +45,7 @@ use crate::{
     stream::CompactBlockStream,
     utils::{get_build_info, ServiceMetadata},
 };
-use zaino_fetch::jsonrpc::connector::{test_node_and_return_uri, JsonRpcConnector};
+use zaino_fetch::jsonrpc::connector::{test_node_and_return_uri, JsonRpcConnector, RpcError};
 use zaino_proto::proto::compact_formats::{
     ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
     CompactTx,
@@ -190,6 +200,478 @@ impl StateService {
                 handle.abort();
             }
         }
+    }
+}
+
+impl ZcashIndexer for StateService {
+    #[doc = " Uses underlying error type of implementer."]
+    type Error = StateServiceError;
+
+    #[doc = " Returns software information from the RPC server, as a [`GetInfo`] JSON struct."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getinfo`](https://zcash.github.io/rpc/getinfo.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: control"]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " [The zcashd reference](https://zcash.github.io/rpc/getinfo.html) might not show some fields"]
+    #[doc = " in Zebra\'s [`GetInfo`]. Zebra uses the field names and formats from the"]
+    #[doc = " [zcashd code](https://github.com/zcash/zcash/blob/v4.6.0-1/src/rpc/misc.cpp#L86-L87)."]
+    #[doc = ""]
+    #[doc = " Some fields from the zcashd reference are missing from Zebra\'s [`GetInfo`]. It only contains the fields"]
+    #[doc = " [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L91-L95)"]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn get_info<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<GetInfo, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
+    }
+
+    #[doc = " Returns blockchain state information, as a [`GetBlockChainInfo`] JSON struct."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getblockchaininfo`](https://zcash.github.io/rpc/getblockchaininfo.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: blockchain"]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " Some fields from the zcashd reference are missing from Zebra\'s [`GetBlockChainInfo`]. It only contains the fields"]
+    #[doc = " [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L72-L89)"]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn get_blockchain_info<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<GetBlockChainInfo, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
+    }
+
+    #[doc = " Returns the total balance of a provided `addresses` in an [`AddressBalance`] instance."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getaddressbalance`](https://zcash.github.io/rpc/getaddressbalance.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: address"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `address_strings`: (object, example={\"addresses\": [\"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ\"]}) A JSON map with a single entry"]
+    #[doc = "     - `addresses`: (array of strings) A list of base-58 encoded addresses."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " zcashd also accepts a single string parameter instead of an array of strings, but Zebra"]
+    #[doc = " doesn\'t because lightwalletd always calls this RPC with an array of addresses."]
+    #[doc = ""]
+    #[doc = " zcashd also returns the total amount of Zatoshis received by the addresses, but Zebra"]
+    #[doc = " doesn\'t because lightwalletd doesn\'t use that information."]
+    #[doc = ""]
+    #[doc = " The RPC documentation says that the returned object has a string `balance` field, but"]
+    #[doc = " zcashd actually [returns an"]
+    #[doc = " integer](https://github.com/zcash/lightwalletd/blob/bdaac63f3ee0dbef62bde04f6817a9f90d483b00/common/common.go#L128-L130)."]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn z_get_address_balance<'life0, 'async_trait>(
+        &'life0 self,
+        address_strings: AddressStrings,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<AddressBalance, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async {
+            let strings_set = address_strings
+                .valid_addresses()
+                .map_err(|e| RpcError::new_from_errorobject(e, "invalid taddrs provided"))?;
+            match self
+                .checked_call(ReadRequest::AddressBalance(strings_set))
+                .await
+            {
+                Ok(ReadResponse::AddressBalance(balance)) => Ok(AddressBalance {
+                    balance: u64::from(balance),
+                }),
+                Ok(unexpected) => {
+                    unreachable!("Unexpected response from state service: {unexpected:?}")
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    #[doc = " Sends the raw bytes of a signed transaction to the local node\'s mempool, if the transaction is valid."]
+    #[doc = " Returns the [`SentTransactionHash`] for the transaction, as a JSON string."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`sendrawtransaction`](https://zcash.github.io/rpc/sendrawtransaction.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: transaction"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `raw_transaction_hex`: (string, required, example=\"signedhex\") The hex-encoded raw transaction bytes."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " zcashd accepts an optional `allowhighfees` parameter. Zebra doesn\'t support this parameter,"]
+    #[doc = " because lightwalletd doesn\'t use it."]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn send_raw_transaction<'life0, 'async_trait>(
+        &'life0 self,
+        raw_transaction_hex: String,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<SentTransactionHash, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async {
+            let raw_transaction_bytes =
+                Vec::from_hex(raw_transaction_hex).map_err(SerializationError::FromHexError)?;
+            let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)?;
+
+            // TODO: The readstateservice doesn't have mempool-interfacing capability as
+            // far as I am aware, I don't know if this is appropriate to be implemented here yet
+
+            todo!("StateService doesn't yet have mempool interfacing capability")
+        })
+    }
+
+    #[doc = " Returns the requested block by hash or height, as a [`GetBlock`] JSON string."]
+    #[doc = " If the block is not in Zebra\'s state, returns"]
+    #[doc = " [error code `-8`.](https://github.com/zcash/zcash/issues/5758) if a height was"]
+    #[doc = " passed or -5 if a hash was passed."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getblock`](https://zcash.github.io/rpc/getblock.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: blockchain"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `hash_or_height`: (string, required, example=\"1\") The hash or height for the block to be returned."]
+    #[doc = " - `verbosity`: (number, optional, default=1, example=1) 0 for hex encoded data, 1 for a json object, and 2 for json object with transaction data."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " Zebra previously partially supported verbosity=1 by returning only the"]
+    #[doc = " fields required by lightwalletd ([`lightwalletd` only reads the `tx`"]
+    #[doc = " field of the result](https://github.com/zcash/lightwalletd/blob/dfac02093d85fb31fb9a8475b884dd6abca966c7/common/common.go#L152))."]
+    #[doc = " That verbosity level was migrated to \"3\"; so while lightwalletd will"]
+    #[doc = " still work by using verbosity=1, it will sync faster if it is changed to"]
+    #[doc = " use verbosity=3."]
+    #[doc = ""]
+    #[doc = " The undocumented `chainwork` field is not returned."]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn z_get_block<'life0, 'async_trait>(
+        &'life0 self,
+        hash_or_height: String,
+        verbosity: Option<u8>,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<GetBlock, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let hash_or_height = hash_or_height.clone();
+        Box::pin(async move {
+            let hash_or_height = HashOrHeight::from_str(&hash_or_height)?;
+            let request = ReadRequest::Block(hash_or_height);
+            let response = self.checked_call(request).await;
+            let block = match response {
+                Ok(ReadResponse::Block(Some(block))) => Ok(block),
+                Ok(ReadResponse::Block(None)) => Err(todo!()),
+                Ok(unexpected) => {
+                    unreachable!("Unexpected response from state service: {unexpected:?}")
+                }
+                Err(e) => Err(e),
+            }?;
+            todo!()
+        })
+    }
+
+    #[doc = " Returns all transaction ids in the memory pool, as a JSON array."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getrawmempool`](https://zcash.github.io/rpc/getrawmempool.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: blockchain"]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn get_raw_mempool<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<Vec<String>, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
+    }
+
+    #[doc = " Returns information about the given block\'s Sapling & Orchard tree state."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`z_gettreestate`](https://zcash.github.io/rpc/z_gettreestate.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: blockchain"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `hash | height`: (string, required, example=\"00000000febc373a1da2bd9f887b105ad79ddc26ac26c2b28652d64e5207c5b5\") The block hash or height."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " The zcashd doc reference above says that the parameter \"`height` can be"]
+    #[doc = " negative where -1 is the last known valid block\". On the other hand,"]
+    #[doc = " `lightwalletd` only uses positive heights, so Zebra does not support"]
+    #[doc = " negative heights."]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn z_get_treestate<'life0, 'async_trait>(
+        &'life0 self,
+        hash_or_height: String,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<GetTreestate, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
+    }
+
+    #[doc = " Returns information about a range of Sapling or Orchard subtrees."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`z_getsubtreesbyindex`](https://zcash.github.io/rpc/z_getsubtreesbyindex.html) - TODO: fix link"]
+    #[doc = " method: post"]
+    #[doc = " tags: blockchain"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `pool`: (string, required) The pool from which subtrees should be returned. Either \"sapling\" or \"orchard\"."]
+    #[doc = " - `start_index`: (number, required) The index of the first 2^16-leaf subtree to return."]
+    #[doc = " - `limit`: (number, optional) The maximum number of subtree values to return."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " While Zebra is doing its initial subtree index rebuild, subtrees will become available"]
+    #[doc = " starting at the chain tip. This RPC will return an empty list if the `start_index` subtree"]
+    #[doc = " exists, but has not been rebuilt yet. This matches `zcashd`\'s behaviour when subtrees aren\'t"]
+    #[doc = " available yet. (But `zcashd` does its rebuild before syncing any blocks.)"]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn z_get_subtrees_by_index<'life0, 'async_trait>(
+        &'life0 self,
+        pool: String,
+        start_index: NoteCommitmentSubtreeIndex,
+        limit: Option<NoteCommitmentSubtreeIndex>,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<GetSubtrees, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
+    }
+
+    #[doc = " Returns the raw transaction data, as a [`GetRawTransaction`] JSON string or structure."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getrawtransaction`](https://zcash.github.io/rpc/getrawtransaction.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: transaction"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `txid`: (string, required, example=\"mytxid\") The transaction ID of the transaction to be returned."]
+    #[doc = " - `verbose`: (number, optional, default=0, example=1) If 0, return a string of hex-encoded data, otherwise return a JSON object."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " We don\'t currently support the `blockhash` parameter since lightwalletd does not"]
+    #[doc = " use it."]
+    #[doc = ""]
+    #[doc = " In verbose mode, we only expose the `hex` and `height` fields since"]
+    #[doc = " lightwalletd uses only those:"]
+    #[doc = " <https://github.com/zcash/lightwalletd/blob/631bb16404e3d8b045e74a7c5489db626790b2f6/common/common.go#L119>"]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn get_raw_transaction<'life0, 'async_trait>(
+        &'life0 self,
+        txid_hex: String,
+        verbose: Option<u8>,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<GetRawTransaction, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
+    }
+
+    #[doc = " Returns the transaction ids made by the provided transparent addresses."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getaddresstxids`](https://zcash.github.io/rpc/getaddresstxids.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: address"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `request`: (object, required, example={\\\"addresses\\\": [\\\"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ\\\"], \\\"start\\\": 1000, \\\"end\\\": 2000}) A struct with the following named fields:"]
+    #[doc = "     - `addresses`: (json array of string, required) The addresses to get transactions from."]
+    #[doc = "     - `start`: (numeric, required) The lower height to start looking for transactions (inclusive)."]
+    #[doc = "     - `end`: (numeric, required) The top height to stop looking for transactions (inclusive)."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " Only the multi-argument format is used by lightwalletd and this is what we currently support:"]
+    #[doc = " <https://github.com/zcash/lightwalletd/blob/631bb16404e3d8b045e74a7c5489db626790b2f6/common/common.go#L97-L102>"]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn get_address_tx_ids<'life0, 'async_trait>(
+        &'life0 self,
+        request: GetAddressTxIdsRequest,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<Vec<String>, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
+    }
+
+    #[doc = " Returns all unspent outputs for a list of addresses."]
+    #[doc = ""]
+    #[doc = " zcashd reference: [`getaddressutxos`](https://zcash.github.io/rpc/getaddressutxos.html)"]
+    #[doc = " method: post"]
+    #[doc = " tags: address"]
+    #[doc = ""]
+    #[doc = " # Parameters"]
+    #[doc = ""]
+    #[doc = " - `addresses`: (array, required, example={\\\"addresses\\\": [\\\"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ\\\"]}) The addresses to get outputs from."]
+    #[doc = ""]
+    #[doc = " # Notes"]
+    #[doc = ""]
+    #[doc = " lightwalletd always uses the multi-address request, without chaininfo:"]
+    #[doc = " <https://github.com/zcash/lightwalletd/blob/master/frontend/service.go#L402>"]
+    #[must_use]
+    #[allow(
+        elided_named_lifetimes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn z_get_address_utxos<'life0, 'async_trait>(
+        &'life0 self,
+        address_strings: AddressStrings,
+    ) -> ::core::pin::Pin<
+        Box<
+            dyn ::core::future::Future<Output = Result<Vec<GetAddressUtxos>, Self::Error>>
+                + ::core::marker::Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        todo!()
     }
 }
 
